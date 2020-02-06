@@ -1,0 +1,256 @@
+#!/usr/bin/env groovy
+ 
+pipeline {
+    options { disableConcurrentBuilds() }
+    agent {
+
+		kubernetes {
+			label "k8s-sure-${cto.devops.jenkins.Utils.getTimestamp()}" 
+			inheritFrom 'k8s-dind' 
+			containerTemplate {
+				name 'suerbuild-kub' 
+			    image 'sure-docker-releases.repo.lab.pl.alcatel-lucent.com/sure-build-container:v14'
+				workingDir '/home/jenkins' 
+				ttyEnabled true 
+				command 'cat' 
+				args ''
+				
+			}
+		  
+		}
+
+	}
+environment {
+    RELEASE_NUMBER = "UIV_MASTER/${env.BUILD_NUMBER}"
+    CommonPath = "/root/.m2/repository/com/nokia/nsw/uiv"
+	scrum22 = "uiv-process-router"
+    RELEASE_NUMBER22 = "/com/nokia/nsw/uiv/$scrum22/${params.RELEASE_VERSION}/"
+   
+	 }
+	
+	stages {
+             
+        stage('checkout'){
+            steps {
+              checkout(
+                  [$class: 'GitSCM',
+                   branches: [[name: "UIV20"]],
+                   doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [],
+                       userRemoteConfigs: [[credentialsId: "uiv-gerrit", refspec: "UIV20",
+                        url: "ssh://ca_uiv_jenkins@gerrit.ext.net.nokia.com:29418/UIV/framework"]],
+						extensions: [[$class: 'RelativeTargetDirectory', 
+					   relativeTargetDir: 'framework']]
+                  ]
+                )
+                 
+            }
+          }
+
+          stage('configure_maven'){
+		  steps {
+		        withCredentials([usernamePassword(credentialsId: 'uiv-artifactory',
+                usernameVariable: 'ARTIFACTORY_USERNAME',
+                passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
+                sh """
+                    sudo sed -i s/ARTIFACTORY_USERNAME/${ARTIFACTORY_USERNAME}/ $WORKSPACE/framework/uiv-build/maven_deploy_settings.xml
+                    sudo sed -i s/ARTIFACTORY_PASSWORD/${ARTIFACTORY_PASSWORD}/ $WORKSPACE/framework/uiv-build/maven_deploy_settings.xml
+                """
+               }
+             }
+		}
+		
+stage('Maven deploy Artifactory') {
+      environment {
+        ARTIFACTORY_LOGIN = credentials('uiv-artifactory')
+      }
+      steps {
+       withCredentials([usernamePassword(credentialsId: 'uiv-artifactory', passwordVariable: 'ARTIFACTORY_PASSWORD', usernameVariable: 'ARTIFACTORY_USERNAME')])
+       {
+          sh """
+/opt/apache-maven-3.3.9/bin/mvn versions:set -DnewVersion=${params.RELEASE_VERSION}_${env.BUILD_NUMBER} -DprocessAllModules -s $WORKSPACE/framework/uiv-build/maven_deploy_settings.xml -f $WORKSPACE/framework/pom.xml -DskipTests=true
+/opt/apache-maven-3.3.9/bin/mvn -s $WORKSPACE/framework/uiv-build/maven_deploy_settings.xml -f $WORKSPACE/framework/pom.xml -B deploy -DskipTests=true -Dartifactory.url=${env.ARTIFACTORY_HTTPS_URL} -Dartifactory.username=${env.ARTIFACTORY_USERNAME} -Dartifactory.password=${env.ARTIFACTORY_PASSWORD} clean install --batch-mode -Prelease-sdk
+#/opt/apache-maven-3.3.9/bin/mvn -s $WORKSPACE/framework/uiv-build/maven_deploy_settings.xml -f $WORKSPACE/framework/pom.xml -DskipTests=true clean install --batch-mode -Prelease-sdk
+#/opt/apache-maven-3.3.9/bin/mvn  -s $WORKSPACE/framework/uiv-build/maven_deploy_settings.xml -f $WORKSPACE/framework/uiv-process-router/floepom.xml -DskipTests=true  install --batch-mode
+#/opt/apache-maven-3.3.9/bin/mvn  -s $WORKSPACE/framework/uiv-build/maven_deploy_settings.xml -f $WORKSPACE/framework/uiv-process-router/rdapom.xml -DskipTests=true  install --batch-mode
+#/opt/apache-maven-3.3.9/bin/mvn  -s $WORKSPACE/framework/uiv-build/maven_deploy_settings.xml -f $WORKSPACE/framework/uiv-process-router/uivrestpom.xml -DskipTests=true  install --batch-mode
+"""
+       }
+          script {
+           
+            def artifactoryServer = Artifactory.newServer url: env.ARTIFACTORY_HTTPS_URL, credentialsId: 'uiv-artifactory'
+			def buildInfo = Artifactory.newBuildInfo()
+          buildInfo.env.capture = true
+          buildInfo.env.collect()
+            artifactoryServer.publishBuildInfo(buildInfo)
+            def promotionConfig = [
+              'buildName'          : buildInfo.name,
+              'buildNumber'        : buildInfo.number,
+              'status'             : 'Released',
+              'targetRepo'         : '${params.Target}',
+              'sourceRepo'         : 'example-mvn-candidates-local',
+              'includeDependencies': false,
+              'copy'               : true, // "copy" must be used because "move" requires delete permission
+              'failFast'           : true
+            ]
+            Artifactory.addInteractivePromotion server: artifactoryServer, promotionConfig: promotionConfig, displayName: "Promote release candidate"
+              }
+        }
+      }
+    
+	
+	 stage('UIV packaging'){
+	   steps {
+	    sh """
+		echo "BUILD_NUMBER:${env.BUILD_NUMBER}" > $WORKSPACE/build.info
+		cd $WORKSPACE/framework/uiv-build/Central_pkg_scripts
+    sh -x DockerCreate_ver.sh ${params.RELEASE_VERSION}
+	sh -x 3pp_pkg_verion.sh ${params.RELEASE_VERSION}_${env.BUILD_NUMBER}
+	#sh -x 3pp_pkg_standalone.sh ${params.RELEASE_VERSION}_${env.BUILD_NUMBER}
+	sh -x dmgr_pkg.sh
+
+		#sh -x 3pp_pkg_backup.sh 
+		#sh -x DockerCreateBackup.sh
+        cd -
+		"""
+        } 
+	}
+  
+  
+  stage ('Publish release candidate') {
+      steps {
+        script {
+          def artifactoryServer = Artifactory.server env.ARTIFACTORY_SERVER_ID
+          artifactoryServer.credentialsId = 'uiv-artifactory'
+          def buildInfo = Artifactory.newBuildInfo()
+          buildInfo.env.capture = true
+          buildInfo.env.collect()
+          def uploadSpec = """{
+            "files": [
+            
+			   {
+                "pattern": "uivfwk${params.RELEASE_VERSION}_${env.BUILD_NUMBER}.tar.gz",
+                 "target": "${params.Target}/${env.RELEASE_NUMBER}/"
+                 
+              },
+			  {
+                "pattern": "uiv_ansible.tar",
+                 "target": "${params.Target}/${env.RELEASE_NUMBER}/"
+              },
+			  {
+                "pattern": "dmgr.tar",
+                 "target": "${params.Target}/${env.RELEASE_NUMBER}/"
+              }
+              
+			  
+	        ]
+          }
+          """         
+          artifactoryServer.upload(uploadSpec, buildInfo)
+          artifactoryServer.publishBuildInfo(buildInfo)
+               def promotionConfig = [
+               'buildName'         : buildInfo.name,
+              'buildNumber'        : buildInfo.number,
+              'status'             : 'Released',
+              'targetRepo'         : 'uiv-mvn-snapshots',
+              'includeDependencies': false,
+              'copy'               : true,
+              'failFast'           : true
+           ]
+          Artifactory.addInteractivePromotion server: artifactoryServer, promotionConfig: promotionConfig, displayName: "Promote release candidate"
+        }
+      }
+    }
+    stage("Generating Changelog File") {
+            steps {
+                script {
+                getChangeString()
+                echo changeString
+                writeFile file: 'changelog.diff', text: changeString
+                emailext (
+                      subject: "Sending diff of Job '${env.JOB_NAME} #${env.BUILD_NUMBER}'",
+                      attachmentsPattern: '**/*.diff',
+                      mimeType: 'text/html',
+                      body: """<p>See attached diff of '${env.JOB_NAME} [${env.BUILD_NUMBER}]'.:</p>
+                        <p>Check rich diff at <a href="${env.BUILD_URL}/last-changes">${env.JOB_NAME} [${env.BUILD_NUMBER}]</a></p>""",
+                      to: "mallarapu.revanth@nokia.com"
+                    )
+
+            }
+        }
+    }
+ 
+	}
+
+
+
+ post {
+        success {
+					sendEmail("Successful")
+                }
+		 failure {
+                    sendEmail("Failed")
+                }
+		unstable {
+               
+                    emailext subject: "[SURE CSF-Devops Jenkins]: ${env.JOB_NAME} ${env.BUILD_NUMBER} build is unstable",
+                    body: "Job URL : ${env.BUILD_URL}",
+                    to: "sudhir.kp@nokia.com" 
+                }
+            }
+}
+	
+@NonCPS
+def getBuildInfo() {
+	def buildInfo = ""
+	buildInfo += "Build # " + currentBuild.number + " - " + currentBuild.currentResult + " !!\n"
+	buildInfo += "Build duration: " + currentBuild.durationString + "\n\n"
+	buildInfo += "Artifacts: \n" + getArtifacts()
+	buildInfo += "\nChanges:\n " + getChangeString()
+	buildInfo += "\n\n Check console output at: ${env.BUILD_URL}console"
+		
+	return buildInfo
+}
+
+@NonCPS
+def getChangeString() {
+	 MAX_MSG_LEN = 150
+	 def changeString = ""
+
+	 echo "Gathering SCM changes"
+	 def changeLogSets = currentBuild.changeSets
+	 for (int i = 0; i < changeLogSets.size(); i++) {
+		 def entries = changeLogSets[i].items
+		 for (int j = 0; j < entries.length; j++) {
+			 def entry = entries[j]
+			 truncated_msg = entry.msg.take(MAX_MSG_LEN)
+			 changeString += " - ${truncated_msg} [${entry.author}]\n"
+		}
+	 }
+
+	 if (!changeString) {
+		changeString = " - No new changes"
+	 }
+	 return changeString
+}
+
+@NonCPS
+def getArtifacts() {
+
+	echo "Gathering Artifacts"
+	def artifacts = ""
+	artifacts +='${BUILD_LOG_REGEX, regex="^.*?consumer.*?Deploying.*?$", linesBefore=0, linesAfter=0, maxMatches=10, showTruncatedLines=false,escapeHtml=true}'
+	
+	if (!artifacts) {
+		artifacts = " - No new artifacts\n"
+	 }
+	 
+	return artifacts;
+}
+
+
+def sendEmail(status) {	 
+	emailext subject: "[UIV CSF-Devops Jenkins]: ${env.JOB_NAME} ${env.BUILD_NUMBER}  build " + status,
+	body: getBuildInfo() + "\n",
+	to: "mallarapu.revanth@nokia.com,sudhir.kp@nokia.com"
+	
+}
