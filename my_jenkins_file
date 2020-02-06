@@ -1,0 +1,43 @@
+pipeline{
+    agent{
+        node{
+            label 'master'
+        }
+    }
+    stages{
+        stage('Checkout'){
+            steps{
+                checkout([$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: '2ba2d178-a6d3-4620-8b51-f0f8405dc95b', url: 'https://github.com/revgit12/simple_java_project_with_sonarqube.git']]])
+            }
+        }
+        stage('Build'){
+            tools {
+                maven 'maven3_6_1'
+            }
+            steps{
+                withSonarQubeEnv('sonar6') {
+                sh 'mvn clean package sonar:sonar'
+                archiveArtifacts '**/*.jar'
+                }
+                
+            }
+        }
+        stage('Publishing Artifacts'){
+            steps{
+                script{
+                    def server = Artifactory.server 'myserver'
+                    def uploadSpec = """{
+                       "files": [{
+                        "pattern": "target/*.jar",
+                        "target": "demo-release/"
+                         }]
+                    }"""
+                    server.upload(uploadSpec)
+                    //def buildInfo = server.upload uploadSpec
+                    //server.publishBuildInfo buildInfo
+                }
+            }
+        }
+        
+    }
+}
